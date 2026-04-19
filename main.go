@@ -6,66 +6,84 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
-func runAdb(args ...string) error {
-	cmd := exec.Command("adb", args...)
-	return cmd.Run()
-}
-
-func installAPK(path string) error {
-	fmt.Printf("Installing %s...", filepath.Base(path))
-	err := runAdb("install", "-r", "-g", path)
-	if err != nil {
-		fmt.Println(" ✗")
-		return err
-	}
-	fmt.Println(" ✓")
-	return nil
-}
-
 func main() {
-	dirPtr := flag.String("dir", ".", "Directory containing APKs")
-	parallelPtr := flag.Int("parallel", 2, "Number of parallel installs")
+	device := flag.String("device", "", "Target device serial")
+	parallel := flag.Int("parallel", 4, "Number of parallel installations")
+	reinstall := flag.Bool("reinstall", false, "Reinstall if already present")
 	flag.Parse()
 
-	files, err := filepath.Glob(filepath.Join(*dirPtr, "*.apk"))
-	if err != nil || len(files) == 0 {
-		fmt.Println("❌ No APK files found in", *dirPtr)
+	apks := flag.Args()
+	if len(apks) == 0 {
+		fmt.Println("Usage: adb-install [options] file1.apk file2.apk ...")
+		fmt.Println("Options:")
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	fmt.Printf("⚡ Found %d APKs, installing with %d parallel workers
+	fmt.Printf("📲 Quick Install — %d APKs, %d parallel\n\n", len(apks), *parallel)
 
-", len(files), *parallelPtr)
+	// Validate files exist
+	for _, apk := range apks {
+		if _, err := os.Stat(apk); err != nil {
+			fmt.Printf("❌ %s: not found\n", apk)
+			os.Exit(1)
+		}
+	}
 
-	semaphore := make(chan struct{}, *parallelPtr)
+	// Install with semaphore for concurrency control
+	sem := make(chan struct{}, *parallel)
 	var wg sync.WaitGroup
-	success, failed := 0, 0
-	var mu sync.Mutex
+	results := make(chan string, len(apks))
 
-	for _, f := range files {
+	for _, apk := range apks {
 		wg.Add(1)
-		go func(path string) {
+		go func(apkPath string) {
 			defer wg.Done()
-			semaphore <- struct{}{}        // acquire
-			defer func() { <-semaphore }() // release
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
 
-			if installAPK(path) == nil {
-				mu.Lock()
-				success++
-				mu.Unlock()
-			} else {
-				mu.Lock()
-				failed++
-				mu.Unlock()
-			}
-		}(f)
+			installAPK(apkPath, *device, *reinstall, results)
+		}(apk)
 	}
 
 	wg.Wait()
-	fmt.Printf("
-✅ Success: %d  ❌ Failed: %d
-", success, failed)
+	close(results)
+
+	// Print results
+	success := 0
+	for msg := range results {
+		fmt.Println(msg)
+		if strings.Contains(msg, "✓") {
+			success++
+		}
+	}
+
+	fmt.Printf("\n✅ %d/%d installed\n", success, len(apks))
+}
+
+func installAPK(apkPath string, device string, reinstall bool, results chan<- string) {
+	name := filepath.Base(apkPath)
+	cmd := exec.Command("adb")
+	
+	if device != "" {
+		cmd.Args = append(cmd.Args, "-s", device)
+	}
+	
+	cmd.Args = append(cmd.Args, "install")
+	if reinstall {
+		cmd.Args = append(cmd.Args, "-r")
+	}
+	cmd.Args = append(cmd.Args, apkPath)
+
+	output, err := cmd.CombinedOutput()
+	
+	if err == nil && strings.Contains(string(output), "Success") {
+		results <- fmt.Sprintf("✓ %s", name)
+	} else {
+		results <- fmt.Sprintf("✗ %s", name)
+	}
 }
